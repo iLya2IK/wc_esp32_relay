@@ -4,6 +4,7 @@ Device configuration via BLE.
 
 Electronic schematic for current project
 
+![alt text](https://github.com/iLya2IK/wc_esp32_relay/blob/main/esp32_relay_schematics.png?raw=true)
 ![alt text](https://github.com/iLya2IK/wc_esp32_relay/blob/main/esp32_rele_plug_top.png?raw=true)
 ![alt text](https://github.com/iLya2IK/wc_esp32_relay/blob/main/esp32_rele_plug_btm.png?raw=true)
 
