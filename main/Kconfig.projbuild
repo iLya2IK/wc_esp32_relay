@@ -1,0 +1,76 @@
+menu "WC Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            SSID (network name) for the example to connect to.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi password (WPA or WPA2) for the example to use.
+
+            Can be left blank if the network has no security set.
+
+    config SERVER_URI
+        string "Server URI"
+        default "https://uri"
+        help
+            Server host URI.
+
+    config SERVER_NAME
+        string "Server user name"
+        default "user name"
+        help
+            The name of user for authorization
+
+    config SERVER_PASS
+        string "Server user password"
+        default "user password"
+        help
+            The password for authorization
+            
+    config WC_DEVICE_NAME
+        string "BLE device service config"
+        default "babaikaWCRelayv1"
+        help
+            The value of BLE UUID for service                   
+            
+    config WC_DEVICE_SERVICE_UUID
+        hex "BLE device service config"
+        default 0x9ef0
+        help
+            The value of BLE UUID for service            
+            
+    config WC_DEVICE_CHAR1_UUID
+        hex "BLE device char 1 config"
+        default 0x9ef5
+        help
+            The value of BLE UUID for char 1 (write char)
+            
+    config WC_DEVICE_CHAR2_UUID
+        hex "BLE device char 2 config"
+        default 0x9ef6
+        help
+            The value of BLE UUID for char 2 (read char)           
+
+endmenu
+
+menu "WC and H2PC configuration"
+
+    config H2PC_INITIAL_RESP_BUFFER
+        hex "Initial resp buffer"
+        default 0x1000
+        help
+            Defines the initial size in bytes of the response buffer
+            
+    config H2PC_MAXIMUM_RESP_BUFFER
+        hex "Maximum resp buffer"
+        default 0x5000
+        help
+            Defines the maximum size in bytes of the response buffer
+                   
+            
+endmenu

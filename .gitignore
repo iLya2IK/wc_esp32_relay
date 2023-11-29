@@ -1,0 +1,5 @@
+build/*
+.vscode/*
+components/*
+*.odt
+output.txt
