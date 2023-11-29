@@ -4,8 +4,8 @@ Device configuration via BLE.
 
 Electronic schematic for current project
 
-![alt text](https://github.com/iLya2IK/webcamdevice/blob/main/esp32_rele_top.png?raw=true)
-![alt text](https://github.com/iLya2IK/webcamdevice/blob/main/esp32_rele_btm.png?raw=true)
+![alt text](https://github.com/iLya2IK/webcamdevice/blob/main/esp32_rele_plug_top.png?raw=true)
+![alt text](https://github.com/iLya2IK/webcamdevice/blob/main/esp32_rele_plug_btm.png?raw=true)
 
 # Protocol description
 Data exchange between devices is carried out according to the HTTP/2 protocol using the POST method. The contents of requests and responses are JSON objects. The description for JSON requests/respones inside sub-protocol you can found [here](https://github.com/iLya2IK/wcwebcamserver/wiki).
