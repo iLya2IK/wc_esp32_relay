@@ -4,3 +4,6 @@
 [submodule "components/http2_protoclient"]
 	path = components/http2_protoclient
 	url = git@github.com:iLya2IK/wch2pc_esp32.git
+[submodule "components/ble_config"]
+	path = components/ble_config
+	url = git@github.com:iLya2IK/wc_ble_config.git

@@ -1,5 +1,4 @@
-set(COMPONENT_SRCS "ble_config.c"
-                   "radiodevice.c"                                                        
+set(COMPONENT_SRCS "radiodevice.c"                                                        
                    "OWIcrc.c"
                    "OWIHighLevelFunctions.c"
                    "OWISWBitFunctions.c")
