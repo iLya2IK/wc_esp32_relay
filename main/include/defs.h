@@ -40,6 +40,9 @@
 
 #define IN_EXT_PWR      GPIO_NUM_33
 
+#define SWITCH_OUT_OFF OUT_ON
+#define SWITCH_OUT_ON  OUT_OFF
+
 extern const char * WC_TAG;
 
 extern const char const DEVICE_NAME [];

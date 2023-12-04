@@ -527,10 +527,20 @@ void msgs_send_cb(void* arg)
     }
 }
 
+static void refresh_ext_pow() {
+    int level = gpio_get_level(IN_EXT_PWR);
+
+    locked_set_ext_power(level > 0);
+}
+
 void broadcast_cb(void* arg)
 {
     ESP_LOGI(WC_TAG, "Broadcast fired");
+
+    refresh_ext_pow();
+
     if (locked_CHK_STATE(AUTHORIZED_BIT)) {
+
         bool need_to_send_broadcast = false;
 
         if (LOCK_MUX) {
@@ -805,16 +815,8 @@ static void consumeStatusTargetLocs() {
     }
 }
 
-static void refresh_ext_pow() {
-    int level = gpio_get_level(IN_EXT_PWR);
-
-    locked_set_ext_power(level > 0);
-}
-
 static void send_broadcast() {
     locked_CLR_STATE(MODE_SEND_BROAD);
-
-    refresh_ext_pow();
 
     if (LOCK_MUX) {
 
@@ -937,18 +939,18 @@ static void update_relay() {
             float dt = temp - mtemp;
 
             if (dt > htemp) {
-                gpio_set_level(OUT_SWITCH, OUT_OFF);
+                gpio_set_level(OUT_SWITCH, SWITCH_OUT_OFF);
                 locked_set_heating(false);
             }
             else
             if (dt < -htemp) {
-                gpio_set_level(OUT_SWITCH, OUT_ON);
+                gpio_set_level(OUT_SWITCH, SWITCH_OUT_ON);
                 locked_set_heating(true);
             }
         }
     } else {
         // for battery saving
-        gpio_set_level(OUT_SWITCH, OUT_OFF);
+        gpio_set_level(OUT_SWITCH, SWITCH_OUT_OFF);
         locked_set_heating(false);
     }
 }
@@ -971,7 +973,7 @@ static void init_board_gpio() {
 
     gpio_pad_select_gpio(OUT_SWITCH);
     gpio_set_direction(OUT_SWITCH, GPIO_MODE_OUTPUT);
-    gpio_set_level(OUT_SWITCH, OUT_OFF);
+    gpio_set_level(OUT_SWITCH, SWITCH_OUT_OFF);
 
     gpio_pad_select_gpio(OUT_LED);
     gpio_set_direction(OUT_LED, GPIO_MODE_OUTPUT);
