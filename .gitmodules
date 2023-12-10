@@ -2,8 +2,11 @@
 	path = components/sh2lib
 	url = git@github.com:iLya2IK/sh2lib.git
 [submodule "components/http2_protoclient"]
-	path = components/http2_protoclient
+	path = components/wch2pc_esp32
 	url = git@github.com:iLya2IK/wch2pc_esp32.git
 [submodule "components/ble_config"]
-	path = components/ble_config
+	path = components/wc_ble_config
 	url = git@github.com:iLya2IK/wc_ble_config.git
+[submodule "components/wch2pc_app"]
+	path = components/wch2pc_app
+	url = git@github.com:iLya2IK/wch2pc_app.git

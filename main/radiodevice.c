@@ -11,23 +11,13 @@
 
 #include "defs.h"
 
-#include "wcstrutils.h"
-
 #include "wcprotocol.h"
-
-#include "ble_config.h"
-
-#include "esp_wifi.h"
-#include <sys/time.h>
-#include "lwip/apps/sntp.h"
-#include "driver/gpio.h"
 #include "http2_protoclient.h"
+#include "wch2pcapp.h"
+
 #include "esp_event_loop.h"
 #include "nvs_flash.h"
-
-#include "esp_bt_defs.h"
-#include "esp_gap_bt_api.h"
-
+#include "driver/gpio.h"
 #include "OWIcrc.h"
 #include "OWIHighLevelFunctions.h"
 #include "OWIBitFunctions.h"
@@ -42,24 +32,30 @@
 
 const char *WC_TAG = "relayhttp2-rsp";
 
-/* mac address for device */
-static char mac_str[13];
-static cJSON * device_meta_data = NULL;
-static char device_name[32];
+/* h2pca */
+static h2pca_config app_cfg;
+static h2pca_status * h2pca_app;
 
-/* wifi config */
-#define APP_WIFI_SSID CONFIG_WIFI_SSID
-#define APP_WIFI_PASS CONFIG_WIFI_PASSWORD
+// additional modes for h2pcapp
+const int  MODE_MEASURE_T    = BIT10;
+const int  MODE_SEND_T       = BIT11;
+const int  MODE_HAS_T        = BIT12;
+// recieve/send msg. is need to send msg from pool to server
+const int  MODE_T_VARS_RW    = BIT13;
+const int  MODE_SEND_BROAD   = BIT14;
 
-/* HTTP2 HOST config */
-// The HTTP/2 server to connect to
-#define HTTP2_SERVER_URI   CONFIG_SERVER_URI
-// The user's name
-#define HTTP2_SERVER_NAME  CONFIG_SERVER_NAME
-// The user's password
-#define HTTP2_SERVER_PASS  CONFIG_SERVER_PASS
+/* timers */
+static esp_timer_handle_t blink_led;
+#define LOC_SEND_MSG_TIMER_DELTA               1000000
+#define LOC_SEND_MSG_NO_EP_TIMER_DELTA         2000000
+#define LOC_GET_MSG_TIMER_DELTA                4000000
+#define LOC_GET_MSG_NO_EP_TIMER_DELTA          8000000
+#define BROADCAST_TIMER_DELTA                  15000000
+#define MEASURE_TEMPERATURE_TIMER_DELTA        10000000
+#define MEASURE_TEMPERATURE_NO_EP_TIMER_DELTA  30000000
+#define LED_BLINK_TIMER_DELTA                  150000
 
-//Blink LED modes
+/* Blink LED modes */
 #define BLINK_LED_OFF             0x0000
 #define BLINK_LED_ON              0xFFFF
 #define BLINK_LED_BLE             0x0033
@@ -69,10 +65,7 @@ static char device_name[32];
 #define BLINK_LED_AUTHORIZED      0x0001
 #define BLINK_LED_ERROR           0xAAAA
 
-
 /* JSON-RPC device metadata */
-/* device's write char to identify */
-static const char * JSON_BLE_CHAR         =  "ble_char";
 
 /* MSGS */
 static const char * JSON_RPC_T            =  "t";
@@ -99,27 +92,7 @@ static const char * JSON_RPC_GET_MODE     =  "getmode";
 static const char * JSON_RPC_CUR_MODE     =  "curmode";
 static const char * JSON_RPC_RUN_MODE     =  "runmode";
 
-/* Modes in state-machina */
-const int WIFI_CONNECTED_BIT = BIT0;
-const int HOST_CONNECTED_BIT = BIT1;
-const int AUTHORIZED_BIT     = BIT2;
-const int MODE_SETIME        = BIT3;
-// autorization step. is device need to authorize
-const int  MODE_AUTH         = BIT4;
-const int  MODE_MEASURE_T    = BIT5;
-const int  MODE_SEND_T       = BIT6;
-const int  MODE_HAS_T        = BIT7;
-// recieve/send msg. is need to send msg from pool to server
-const int  MODE_RECIEVE_MSG  = BIT8;
-const int  MODE_SEND_MSG     = BIT9;
-const int  MODE_T_VARS_RW    = BIT10;
-const int  MODE_SEND_BROAD   = BIT11;
-
-const int  MODE_ALL          = 0xfffffe;
-
 /* global vars */
-volatile int  wifi_connect_errors = 0;           // wifi connection failed tryes count
-volatile int  connect_errors = 0;                // connection failed tryes count
 volatile uint16_t  CUR_BLINK_PATTERN_LOC = 1;    // current LED blink pattern pos
 /* T-variables (protected for multi-threaded purposes) */
 #define MAX_T_MODES 3
@@ -142,7 +115,6 @@ volatile float    LST_BRD_STATUS_T = 0.0;
 volatile float    LST_BRD_STATUS_TARGET_T = 5.0;
 
 /* state routes */
-static EventGroupHandle_t client_state = NULL; // state mask locker for multi-thread access
 static SemaphoreHandle_t vars_mux = NULL;      // mt vars set/get
 
 #define LOCK_MUX   (xSemaphoreTakeRecursive(vars_mux, portMAX_DELAY) == pdTRUE)
@@ -194,7 +166,6 @@ uint32_t locked_get_broadcast_time() {
 void locked_set_broadcast_time(uint32_t value) {
     PROTECTED_SET_MUX(BROADCAST_TIME, value);
 }
-
 
 float locked_get_t_mode(uint8_t mode) {
     float val;
@@ -304,292 +275,7 @@ bool locked_syn_heating() {
     return res;
 }
 
-/* thread-safe get states route */
-static uint32_t locked_GET_STATES() {
-    return xEventGroupGetBits(client_state);
-}
-
-/* thread-safe check state route */
-static bool locked_CHK_STATE(uint32_t astate) {
-    bool val = locked_GET_STATES(client_state) & astate;
-    return val;
-}
-
-static void locked_CLR_STATE(uint32_t astate) {
-    xEventGroupClearBits(client_state, astate);
-}
-
-static void locked_SET_STATE(uint32_t astate) {
-    xEventGroupSetBits(client_state, astate);
-}
-
-/* thread-safe clear all states route */
-static void locked_CLR_ALL_STATES() {
-    locked_CLR_STATE(MODE_ALL);
-}
-
-/* timers */
-static esp_timer_handle_t msgs_recieve;
-static esp_timer_handle_t msgs_send;
-static esp_timer_handle_t meas_temp;
-static esp_timer_handle_t broadcast;
-static esp_timer_handle_t blink_led;
-#define SEND_MSG_TIMER_DELTA                   1000000
-#define SEND_MSG_NO_EP_TIMER_DELTA             2000000
-#define GET_MSG_TIMER_DELTA                    4000000
-#define GET_MSG_NO_EP_TIMER_DELTA              8000000
-#define BROADCAST_TIMER_DELTA                  15000000
-#define MEASURE_TEMPERATURE_TIMER_DELTA        10000000
-#define MEASURE_TEMPERATURE_NO_EP_TIMER_DELTA  30000000
-#define LED_BLINK_TIMER_DELTA                  150000
-
-/* forward decrlarations */
-void finalize_app();
-
-static void set_time(void)
-{
-    struct timeval tv = {
-        .tv_sec = 1509449941,
-    };
-    struct timezone tz;
-    memset(&tz, 0, sizeof(tz));
-    settimeofday(&tv, &tz);
-
-    /* Start SNTP service */
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_init();
-}
-
-static void consume_protocol_error() {
-    if (h2pc_get_last_error() == REST_ERR_NO_SUCH_SESSION) {
-        locked_CLR_ALL_STATES();
-        locked_SET_STATE(MODE_AUTH);
-    }
-}
-
-/* disconnect from host. reset all states */
-static void disconnect_host() {
-    if (locked_CHK_STATE(HOST_CONNECTED_BIT))
-        h2pc_disconnect_http2();
-    else
-        h2pc_reset_buffers();
-    locked_CLR_ALL_STATES();
-    locked_set_blink_pattern(BLINK_LED_ERROR);
-}
-
-/* connect to host */
-static void connect_to_http2() {
-    disconnect_host();
-
-    char * addr;
-    if (WC_CFG_VALUES != NULL)
-        addr = get_cfg_value(CFG_HOST_NAME);
-    else
-        addr = HTTP2_SERVER_URI;
-
-    if (h2pc_connect_to_http2(addr)) {
-        connect_errors = 0;
-        locked_SET_STATE(HOST_CONNECTED_BIT | MODE_AUTH);
-    } else
-        connect_errors++;
-}
-
-static void send_authorize() {
-    ESP_LOGI(WC_TAG, "Trying to authorize");
-
-    const char * _name;
-    const char * _pwrd;
-    const char * _device;
-
-    if (WC_CFG_VALUES != NULL) {
-        _name =  get_cfg_value(CFG_USER_NAME);
-        _pwrd =  get_cfg_value(CFG_USER_PASSWORD);
-        _device = get_cfg_value(CFG_DEVICE_NAME);
-    }
-    else {
-        _name =  HTTP2_SERVER_NAME;
-        _pwrd =  HTTP2_SERVER_PASS;
-        _device =  mac_str;
-    }
-
-    int res = h2pc_req_authorize_sync(_name, _pwrd, _device, device_meta_data, false);
-
-    if (res == ESP_OK) {
-        locked_CLR_STATE(MODE_AUTH);
-        locked_SET_STATE(AUTHORIZED_BIT | MODE_RECIEVE_MSG);
-        strcpy(device_name, _device);
-        ESP_LOGI(WC_TAG, "hash=%s", h2pc_get_sid());
-    }
-    else
-    if (res == H2PC_ERR_PROTOCOL)
-        consume_protocol_error();
-    else
-        disconnect_host();
-}
-
-static void recieve_msgs() {
-    int res = h2pc_req_get_msgs_sync();
-    if (res == ESP_OK)
-        locked_CLR_STATE(MODE_RECIEVE_MSG);
-}
-
-static void send_msgs() {
-    int res = h2pc_req_send_msgs_sync();
-    if (res == ESP_OK)
-        locked_CLR_STATE(MODE_SEND_MSG);
-}
-
-static esp_err_t event_handler(void *ctx, system_event_t *event)
-{
-    switch (event->event_id) {
-    case SYSTEM_EVENT_STA_START:
-        ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_START");
-        ESP_ERROR_CHECK(esp_wifi_connect());
-        locked_set_blink_pattern(BLINK_LED_WIFI_START);
-        break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-        ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_GOT_IP");
-        ESP_LOGI(WC_TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
-        locked_SET_STATE(WIFI_CONNECTED_BIT);
-        locked_SET_STATE(MODE_SETIME);
-        wifi_connect_errors = 0;
-        break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-        ESP_LOGI(WC_TAG, "SYSTEM_EVENT_STA_DISCONNECTED");
-
-        wifi_connect_errors++;
-
-        sntp_stop();
-
-        if (locked_CHK_STATE(HOST_CONNECTED_BIT)) h2pc_disconnect_http2();
-        locked_CLR_ALL_STATES();
-
-        locked_CLR_STATE(WIFI_CONNECTED_BIT);
-        h2pc_reset_buffers();
-        break;
-    default:
-        break;
-    }
-    return ESP_OK;
-}
-
-static void initialise_wifi(void)
-{
-    locked_set_blink_pattern(BLINK_LED_WIFI_START);
-    tcpip_adapter_init();
-    ESP_ERROR_CHECK( esp_event_loop_init(event_handler, NULL) );
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
-    ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-    wifi_config_t wifi_config;
-    memset(&wifi_config, 0x00, sizeof(wifi_config_t));
-
-    char * value = get_cfg_value(CFG_SSID_NAME);
-    if (value != NULL) {
-        strcpy((char *) &(wifi_config.sta.ssid[0]), value);
-        ESP_LOGD(WC_TAG, "SSID setted from json config");
-    } else {
-        strcpy((char *) &(wifi_config.sta.ssid[0]), APP_WIFI_SSID);
-        ESP_LOGD(WC_TAG, "SSID setted from flash config");
-    }
-    value = get_cfg_value(CFG_SSID_PASSWORD);
-    if (value != NULL) {
-        strcpy((char *) &(wifi_config.sta.password[0]), value);
-        ESP_LOGD(WC_TAG, "Password setted from json config");
-    } else {
-        strcpy((char *) &(wifi_config.sta.password[0]), APP_WIFI_PASS);
-        ESP_LOGD(WC_TAG, "Password setted from flash config");
-    }
-
-    ESP_LOGI(WC_TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
-    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
-    ESP_ERROR_CHECK( esp_wifi_start() );
-}
-
-void msgs_get_cb(void* arg)
-{
-    ESP_LOGD(WC_TAG, "Recieve msgs fired");
-    bool isempty = h2pc_im_locked_waiting();
-    if (isempty) {
-        if (locked_CHK_STATE(HOST_CONNECTED_BIT))
-            locked_SET_STATE(MODE_RECIEVE_MSG);
-    }
-}
-
-void msgs_send_cb(void* arg)
-{
-    ESP_LOGD(WC_TAG, "Send msgs fired");
-    bool isnempty = h2pc_om_locked_waiting();
-    if (isnempty) {
-        if (locked_CHK_STATE(HOST_CONNECTED_BIT))
-            locked_SET_STATE(MODE_SEND_MSG);
-    }
-}
-
-static void refresh_ext_pow() {
-    int level = gpio_get_level(IN_EXT_PWR);
-
-    locked_set_ext_power(level > 0);
-}
-
-void broadcast_cb(void* arg)
-{
-    ESP_LOGI(WC_TAG, "Broadcast fired");
-
-    refresh_ext_pow();
-
-    if (locked_CHK_STATE(AUTHORIZED_BIT)) {
-
-        bool need_to_send_broadcast = false;
-
-        if (LOCK_MUX) {
-            if (ENABLE_BROADCAST) {
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-
-                if (tv.tv_sec < BROADCAST_TIME) {
-                    need_to_send_broadcast = true;
-                } else
-                if ((tv.tv_sec - BROADCAST_TIME) >= 3000) { // 5 min is over
-                    need_to_send_broadcast = true;
-                } else
-                if ((tv.tv_sec - BROADCAST_TIME) >= 30) {   // 0.5 minute is over
-                    if (fabs(LST_BRD_STATUS_T - TEMPERATURE) >= 0.25)
-                        need_to_send_broadcast = true;
-                    else
-                    if (LST_BRD_STATUS_TARGET_T != T_MODES[T_MODE_CUR])
-                        need_to_send_broadcast = true;
-                    else
-                    if (LST_BRD_STATUS_EXT_POW != EXT_POWER)
-                        need_to_send_broadcast = true;
-                    else
-                    if (LST_BRD_STATUS_HEATING != HEATING)
-                        need_to_send_broadcast = true;
-                }
-            }
-            UNLOCK_MUX;
-        }
-        if (need_to_send_broadcast)
-            locked_SET_STATE(MODE_SEND_BROAD);
-    }
-}
-
-void meas_temp_cb(void* arg)
-{
-    ESP_LOGD(WC_TAG, "Measure temperature fired");
-    locked_SET_STATE(MODE_MEASURE_T);
-}
-
-void blink_led_cb(void * arg) {
-    CUR_BLINK_PATTERN_LOC <<= 1;
-    if (CUR_BLINK_PATTERN_LOC == 0)
-        CUR_BLINK_PATTERN_LOC = 1;
-    if (CUR_BLINK_PATTERN_LOC & locked_get_blink_pattern())
-        gpio_set_level(OUT_LED, OUT_ON);
-    else
-        gpio_set_level(OUT_LED, OUT_OFF);
-}
+/* internal relay logic */
 
 #define MODE_OP_GET 0
 #define MODE_OP_SET 1
@@ -654,7 +340,7 @@ static void send_is_broad(const char * src_s, cJSON * omsg) {
 static void send_status(const char * src_s, uint8_t mask, cJSON * omsg) {
     if (LOCK_MUX) {
 
-        if (((mask&STATUS_T_SEND) != 0) && locked_CHK_STATE(MODE_HAS_T))
+        if (((mask&STATUS_T_SEND) != 0) && h2pca_locked_CHK_STATE(MODE_HAS_T))
             cJSON_AddNumberToObject(omsg,  JSON_RPC_T,        TEMPERATURE);
         if ((mask&(STATUS_TT_SEND|STATUS_MID_SEND)) != 0) {
             cJSON_AddNumberToObject(omsg,  JSON_RPC_TARGET_T, T_MODES[T_MODE_CUR]);
@@ -709,7 +395,7 @@ static void setStatusTargetBit(int trg, uint8_t bitmask) {
 
 bool on_incoming_msg(const cJSON * src, const cJSON * kind, const cJSON * iparams, const cJSON * msg_id) {
     char * src_s = src->valuestring;
-    if (strcmp(src_s, device_name) != 0) {
+    if (strcmp(src_s, h2pca_get_status()->device_name) != 0) {
         int trgloc = getStatusTargetLoc(src_s);
 
         char * kind_s = kind->valuestring;
@@ -815,8 +501,24 @@ static void consumeStatusTargetLocs() {
     }
 }
 
+static void refresh_ext_pow() {
+    int level = gpio_get_level(IN_EXT_PWR);
+
+    locked_set_ext_power(level > 0);
+}
+
+void blink_led_cb(void * arg) {
+    CUR_BLINK_PATTERN_LOC <<= 1;
+    if (CUR_BLINK_PATTERN_LOC == 0)
+        CUR_BLINK_PATTERN_LOC = 1;
+    if (CUR_BLINK_PATTERN_LOC & locked_get_blink_pattern())
+        gpio_set_level(OUT_LED, OUT_ON);
+    else
+        gpio_set_level(OUT_LED, OUT_OFF);
+}
+
 static void send_broadcast() {
-    locked_CLR_STATE(MODE_SEND_BROAD);
+    h2pca_locked_CLR_STATE(MODE_SEND_BROAD);
 
     if (LOCK_MUX) {
 
@@ -841,7 +543,7 @@ static void send_broadcast() {
 static void measure_ext_power() {
 
     if (locked_syn_ext_power()) {
-        if (locked_CHK_STATE(AUTHORIZED_BIT)) {
+        if (h2pca_locked_CHK_STATE(AUTHORIZED_BIT)) {
             cJSON * oparams = cJSON_CreateObject();
             cJSON_AddBoolToObject(oparams, JSON_RPC_EXT_POW, locked_get_ext_power());
             h2pc_om_add_msg(JSON_RPC_STATUS, JSON_RPC_TARGET_BROADCAST, oparams);
@@ -853,7 +555,7 @@ static void measure_ext_power() {
 static void measure_heating() {
 
     if (locked_syn_heating()) {
-        if (locked_CHK_STATE(AUTHORIZED_BIT)) {
+        if (h2pca_locked_CHK_STATE(AUTHORIZED_BIT)) {
             cJSON * oparams = cJSON_CreateObject();
             cJSON_AddBoolToObject(oparams, JSON_RPC_HEAT, locked_get_heating());
             h2pc_om_add_msg(JSON_RPC_STATUS, JSON_RPC_TARGET_BROADCAST, oparams);
@@ -865,7 +567,7 @@ static void measure_heating() {
 static void measure_temperature() {
     static uint8_t sensor_data[8] = {0};
 
-    ESP_LOGI(JSON_CFG, "OWI temperature measuring");
+    ESP_LOGI(WC_TAG, "OWI temperature measuring");
 
     if (OWI_DetectPresence(OW_PNUM)) {
 
@@ -877,7 +579,7 @@ static void measure_temperature() {
         uint8_t c = 0;
         bool ready = true;
         while ((OWI_DetectFinished(OW_PNUM) == 0)) {
-            ESP_LOGI(JSON_CFG, "OWI measuring timeout");
+            ESP_LOGI(WC_TAG, "OWI measuring timeout");
             vTaskDelay(configTICK_RATE_HZ / 4);
             c++;
             if (c == 4) {
@@ -887,7 +589,7 @@ static void measure_temperature() {
         }
 
         if (!ready)
-            ESP_LOGI(JSON_CFG, "OWI is not ready");
+            ESP_LOGI(WC_TAG, "OWI is not ready");
 
         // Read Scratch memory area
         if (ready && (OWI_DetectPresence(OW_PNUM) != 0)) {
@@ -922,8 +624,8 @@ static void measure_temperature() {
                 if (sign) value = -value;
                 locked_set_temperature(value);
 
-                locked_SET_STATE(MODE_HAS_T);
-                locked_CLR_STATE(MODE_MEASURE_T);
+                h2pca_locked_SET_STATE(MODE_HAS_T);
+                h2pca_locked_CLR_STATE(MODE_MEASURE_T);
             }
 
         }
@@ -932,7 +634,7 @@ static void measure_temperature() {
 
 static void update_relay() {
     if (locked_get_ext_power()) {
-        if (locked_CHK_STATE(MODE_HAS_T)) {
+        if (h2pca_locked_CHK_STATE(MODE_HAS_T)) {
             float temp  = locked_get_temperature();
             float mtemp = locked_get_cur_t_mode_value();
             float htemp = locked_get_hyst();
@@ -1006,323 +708,180 @@ static void nvs_read_tvars(nvs_handle h) {
     uint8_t v = 0;
     if (nvs_get_u8(h, JSON_RPC_IS_BROAD, &v) != ESP_OK) return;
     ENABLE_BROADCAST = v;
+    T_VARS_CHANGED = false;
 }
 
-static void check_h2pc_errors() {
-    if (locked_CHK_STATE(WIFI_CONNECTED_BIT|HOST_CONNECTED_BIT)) {
-        if (h2pc_get_connected()) {
-            if (h2pc_get_protocol_errors_cnt() > 0) {
-                if (h2pc_get_last_error() == REST_ERR_NO_SUCH_SESSION) {
-                    locked_CLR_STATE(AUTHORIZED_BIT);
-                    locked_SET_STATE(MODE_AUTH);
-                } else
-                    disconnect_host();
-            }
-        } else {
-            disconnect_host();
-        }
-    }
+/* h2pca callbacks */
+
+static void on_disconnect_host() {
+    locked_set_blink_pattern(BLINK_LED_ERROR);
 }
 
-#define MAIN_TASK_LOOP_DELAY 200
+static void on_wifi_init() {
+    locked_set_blink_pattern(BLINK_LED_WIFI_START);
+}
 
-static void main_task(void *args)
-{
-    nvs_handle my_handle;
-    esp_err_t err;
-    cJSON * loc_cfg = NULL;
-
-    err = nvs_open(DEVICE_CONFIG, NVS_READWRITE, &my_handle);
-    if (err == ESP_OK) {
-        size_t required_size;
-        err = nvs_get_str(my_handle, JSON_CFG, NULL, &required_size);
-        if (err == ESP_OK) {
-            char * cfg_str = malloc(required_size);
-            nvs_get_str(my_handle, JSON_CFG, cfg_str, &required_size);
-            loc_cfg = cJSON_Parse(cfg_str);
-            free(cfg_str);
-            ESP_LOGD(JSON_CFG, "JSON cfg founded");
-            #ifdef LOG_DEBUG
-            esp_log_buffer_char(JSON_CFG, cfg_str, strlen(cfg_str));
-            #endif
-        }
-        nvs_read_tvars(my_handle);
-        T_VARS_CHANGED = false;
-    }
-
-    if (loc_cfg == NULL) {
-        loc_cfg = cJSON_CreateArray();
-        cJSON * cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_DEVICE_NAME), mac_str);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-        cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_USER_NAME), HTTP2_SERVER_NAME);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-        cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_USER_PASSWORD), HTTP2_SERVER_PASS);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-        cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_HOST_NAME), HTTP2_SERVER_URI);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-        cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_SSID_NAME), APP_WIFI_SSID);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-        cfg_item = cJSON_CreateObject();
-        cJSON_AddStringToObject(cfg_item, get_cfg_id(CFG_SSID_PASSWORD), APP_WIFI_PASS);
-        cJSON_AddItemToArray(loc_cfg, cfg_item);
-    }
-
+static void on_ble_cfg_start() {
     locked_set_blink_pattern(BLINK_LED_BLE);
+}
 
-    error_t ret = initialize_ble(loc_cfg);
-    cJSON_Delete(loc_cfg);
-    if (ret == OK) {
-        start_ble_config_round();
-        while ( ble_config_proceed() ) {
-            vTaskDelay(1000);
-        }
-        stop_ble_config_round();
-
-        if (WC_CFG_VALUES != NULL) {
-            char * cfg_str = cJSON_PrintUnformatted(WC_CFG_VALUES);
-            nvs_set_str(my_handle, JSON_CFG, cfg_str);
-            nvs_commit(my_handle);
-
-            #ifdef LOG_DEBUG
-            esp_log_buffer_char(JSON_CFG, cfg_str, strlen(cfg_str));
-            #endif
-
-            cJSON_free(cfg_str);
-        }
-    }
-    nvs_close(my_handle);
-
-
-    ESP_ERROR_CHECK(h2pc_initialize(H2PC_MODE_MESSAGING));
-    initialise_wifi();
-
-    /* init timers */
-    esp_timer_create_args_t timer_args;
-
-    timer_args.callback = &msgs_get_cb;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_recieve));
-
-    timer_args.callback = &msgs_send_cb;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &msgs_send));
-
-    timer_args.callback = &meas_temp_cb;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &meas_temp));
-
-    timer_args.callback = &broadcast_cb;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &broadcast));
-
-    /* start timers */
-    esp_timer_start_periodic(msgs_recieve, GET_MSG_TIMER_DELTA);
-    esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
-    esp_timer_start_periodic(meas_temp, MEASURE_TEMPERATURE_TIMER_DELTA);
-    esp_timer_start_periodic(broadcast, BROADCAST_TIMER_DELTA);
-
-    int connectDelay = 0;
-    int wifiDisconnectedTime = 0;
-
-    while (1)
+static void on_begin_step() {
+    switch (h2pca_locked_GET_STATES() & 0x000007)
     {
-        // ESP_LOGI(WC_TAG, "New step. states: %d", locked_GET_STATES());
+    case 0:
+        locked_set_blink_pattern(BLINK_LED_WIFI_START);
+        break;
+    case (uint32_t)(WIFI_CONNECTED_BIT):
+        locked_set_blink_pattern(BLINK_LED_WIFI_CONNECTED);
+        break;
+    case (uint32_t)(WIFI_CONNECTED_BIT|HOST_CONNECTED_BIT):
+        locked_set_blink_pattern(BLINK_LED_HOST_CONNECTED);
+        break;
+    case (uint32_t)(WIFI_CONNECTED_BIT|HOST_CONNECTED_BIT|AUTHORIZED_BIT):
+        locked_set_blink_pattern(BLINK_LED_AUTHORIZED);
+        break;
+    default:
+        locked_set_blink_pattern(BLINK_LED_ERROR);
+        break;
+    }
 
-        switch (locked_GET_STATES() & 0x000007)
-        {
-        case 0:
-            locked_set_blink_pattern(BLINK_LED_WIFI_START);
-            break;
-        case (uint32_t)(WIFI_CONNECTED_BIT):
-            locked_set_blink_pattern(BLINK_LED_WIFI_CONNECTED);
-            break;
-        case (uint32_t)(WIFI_CONNECTED_BIT|HOST_CONNECTED_BIT):
-            locked_set_blink_pattern(BLINK_LED_HOST_CONNECTED);
-            break;
-        case (uint32_t)(WIFI_CONNECTED_BIT|HOST_CONNECTED_BIT|AUTHORIZED_BIT):
-            locked_set_blink_pattern(BLINK_LED_AUTHORIZED);
-            break;
-        default:
-            locked_set_blink_pattern(BLINK_LED_ERROR);
-            break;
-        }
+    if (locked_get_ext_power()) {
+        app_cfg.recv_msgs_period = LOC_GET_MSG_TIMER_DELTA;
+        app_cfg.send_msgs_period = LOC_SEND_MSG_TIMER_DELTA;
+    } else {
+        app_cfg.recv_msgs_period = LOC_GET_MSG_NO_EP_TIMER_DELTA;
+        app_cfg.send_msgs_period = LOC_SEND_MSG_NO_EP_TIMER_DELTA;
+    }
+}
 
-        if (locked_CHK_STATE(WIFI_CONNECTED_BIT)) {
+static void on_finish_step() {
+    if (LOCK_MUX) {
+        if (T_VARS_CHANGED) {
+            nvs_handle my_handle;
+            esp_err_t err;
 
-            wifiDisconnectedTime = 0;
-
-            if (locked_CHK_STATE(MODE_SETIME)) {
-                /* Set current time: proper system time is required for TLS based
-                 * certificate verification.
-                 */
-                set_time();
-                locked_CLR_STATE(MODE_SETIME);
-            }
-
-
-            if (locked_CHK_STATE(HOST_CONNECTED_BIT)) {
-
-                /* authorize the device on server */
-                if (locked_CHK_STATE(MODE_AUTH)) {
-                    send_authorize();
-                    check_h2pc_errors();
-                }
-                /* gathering incoming msgs from server */
-                if (locked_CHK_STATE(MODE_RECIEVE_MSG)) {
-                    esp_timer_stop(msgs_recieve);
-                    recieve_msgs();
-                    check_h2pc_errors();
-                    if (locked_get_ext_power())
-                        esp_timer_start_periodic(msgs_recieve, GET_MSG_TIMER_DELTA);
-                    else
-                        esp_timer_start_periodic(msgs_recieve, GET_MSG_NO_EP_TIMER_DELTA);
-                }
-                /* proceed incoming messages */
-                resetStatusTargetLocs();
-                h2pc_im_proceed(&on_incoming_msg, 16);
-                consumeStatusTargetLocs();
-
-                if (locked_CHK_STATE(MODE_SEND_BROAD)) {
-                    send_broadcast();
-                }
-
-                /* send outgoing messages */
-                if (locked_CHK_STATE(MODE_SEND_MSG)) {
-                    esp_timer_stop(msgs_send);
-                    send_msgs();
-                    check_h2pc_errors();
-                    if (locked_get_ext_power())
-                        esp_timer_start_periodic(msgs_send, SEND_MSG_TIMER_DELTA);
-                    else
-                        esp_timer_start_periodic(msgs_send, SEND_MSG_NO_EP_TIMER_DELTA);
-                }
-
-            } else {
-
-                connectDelay -= MAIN_TASK_LOOP_DELAY;
-
-                if (connectDelay <= 0) {
-
-                    connect_to_http2();
-
-                    if (connect_errors) {
-                        switch (connect_errors)
-                        {
-                        case 11:
-                            connectDelay = 300 * configTICK_RATE_HZ; // 5 minutes
-                            break;
-                        case 12:
-                            assert(ESP_ERR_INVALID_STATE); // drop to deep reload if no connection to host over 15 minutes
-                            break;
-                        default:
-                            connectDelay = connect_errors * 10 * configTICK_RATE_HZ;
-                            break;
-                        }
-                    } else
-                        connectDelay = 0;
-
-                }
-
-            }
-
-        } else {
-            wifiDisconnectedTime += MAIN_TASK_LOOP_DELAY;
-
-            if (wifiDisconnectedTime > 900000)
-                assert(ESP_ERR_INVALID_STATE); // drop to deep reload if no connection to AP over 15 minutes
-
-            connectDelay -= MAIN_TASK_LOOP_DELAY;
-
-            if ((connectDelay <= 0) && (wifi_connect_errors)) {
-
-                wifi_connect_errors = 0;
-                ESP_ERROR_CHECK(esp_wifi_connect());
-
-                connectDelay = 30 * configTICK_RATE_HZ; // 30 sec timeout between two wifi connection attempts
+            err = nvs_open(DEVICE_CONFIG, NVS_READWRITE, &my_handle);
+            if (err == ESP_OK) {
+                if (nvs_write_tvars(my_handle))
+                    T_VARS_CHANGED = false;
+                nvs_close(my_handle);
             }
         }
-        /* measure temperature open/close relay */
-        if (locked_CHK_STATE(MODE_MEASURE_T)) {
-            esp_timer_stop(meas_temp);
-            measure_temperature();
-            if (locked_get_ext_power())
-                esp_timer_start_periodic(meas_temp, MEASURE_TEMPERATURE_TIMER_DELTA);
-            else
-                esp_timer_start_periodic(meas_temp, MEASURE_TEMPERATURE_NO_EP_TIMER_DELTA);
-        }
+        UNLOCK_MUX;
+    }
+    /* measure ext power */
+    measure_ext_power();
+    update_relay();
+    measure_heating();
+}
+
+static void sync_measure_t_task_cb(h2pca_task_id id,
+                                     h2pca_state cur_state,
+                                     void * user_data,
+                                     uint32_t * restart_period) {
+    measure_temperature();
+    if (locked_get_ext_power())
+        *restart_period = MEASURE_TEMPERATURE_TIMER_DELTA;
+    else
+        *restart_period = MEASURE_TEMPERATURE_NO_EP_TIMER_DELTA;
+}
+
+static void broadcast_cb(h2pca_task_id id, void * user_data)
+{
+    refresh_ext_pow();
+
+    if (h2pca_locked_CHK_STATE(AUTHORIZED_BIT)) {
+
+        bool need_to_send_broadcast = false;
+
         if (LOCK_MUX) {
-            if (T_VARS_CHANGED) {
-                err = nvs_open(DEVICE_CONFIG, NVS_READWRITE, &my_handle);
-                if (err == ESP_OK) {
-                    if (nvs_write_tvars(my_handle))
-                        T_VARS_CHANGED = false;
-                    nvs_close(my_handle);
+            if (ENABLE_BROADCAST) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+
+                if (tv.tv_sec < BROADCAST_TIME) {
+                    need_to_send_broadcast = true;
+                } else
+                if ((tv.tv_sec - BROADCAST_TIME) >= 3000) { // 5 min is over
+                    need_to_send_broadcast = true;
+                } else
+                if ((tv.tv_sec - BROADCAST_TIME) >= 30) {   // 0.5 minute is over
+                    if (fabs(LST_BRD_STATUS_T - TEMPERATURE) >= 0.25)
+                        need_to_send_broadcast = true;
+                    else
+                    if (LST_BRD_STATUS_TARGET_T != T_MODES[T_MODE_CUR])
+                        need_to_send_broadcast = true;
+                    else
+                    if (LST_BRD_STATUS_EXT_POW != EXT_POWER)
+                        need_to_send_broadcast = true;
+                    else
+                    if (LST_BRD_STATUS_HEATING != HEATING)
+                        need_to_send_broadcast = true;
                 }
             }
             UNLOCK_MUX;
         }
-        /* measure ext power */
-        measure_ext_power();
-        update_relay();
-        measure_heating();
-
-        vTaskDelay(MAIN_TASK_LOOP_DELAY);
+        if (need_to_send_broadcast)
+            h2pca_locked_SET_STATE(MODE_SEND_BROAD);
     }
-
-    finalize_app();
-
-    vTaskDelete(NULL);
 }
 
-
-void finalize_app()
-{
-    disconnect_host();
-
-    esp_timer_stop(msgs_send);
-    esp_timer_stop(msgs_recieve);
-    esp_timer_stop(meas_temp);
-    esp_timer_stop(broadcast);
-
-
-    h2pc_finalize();
-
-    if (device_meta_data) free(device_meta_data);
+static void sync_broadcast_task_cb(h2pca_task_id id,
+                                     h2pca_state cur_state,
+                                     void * user_data,
+                                     uint32_t * restart_period) {
+    send_broadcast();
 }
-
-static char DEVICE_CHAR [] = "00000000";
 
 void app_main()
 {
-    esp_err_t err;
+    esp_err_t err = h2pca_init_cfg(&app_cfg);
+    ESP_ERROR_CHECK(err);
 
-    client_state = xEventGroupCreate();
+    app_cfg.LOG_TAG = WC_TAG;
+
+    app_cfg.h2pcmode = H2PC_MODE_MESSAGING;
+    app_cfg.recv_msgs_period = LOC_GET_MSG_TIMER_DELTA;
+    app_cfg.send_msgs_period = LOC_SEND_MSG_TIMER_DELTA;
+    app_cfg.inmsgs_proceed_chunk = 16;
+
+    app_cfg.on_wifi_init = &on_wifi_init;
+    app_cfg.on_disconnect = &on_disconnect_host;
+    app_cfg.on_read_nvs = &nvs_read_tvars;
+    app_cfg.on_ble_cfg_start = &on_ble_cfg_start;
+    app_cfg.on_begin_step = &on_begin_step;
+    app_cfg.on_before_inmsgs = &resetStatusTargetLocs;
+    app_cfg.on_after_inmsgs = &consumeStatusTargetLocs;
+    app_cfg.on_next_inmsg = &on_incoming_msg;
+    app_cfg.on_finish_step = &on_finish_step;
+
+    h2pca_task * tsk;
+
+    tsk = h2pca_new_task("Measure", 1, NULL, &err);
+    ESP_ERROR_CHECK(err);
+    tsk->on_sync = &sync_measure_t_task_cb;
+    tsk->apply_bitmask = MODE_MEASURE_T;
+    tsk->req_bitmask = 0;
+    tsk->period = MEASURE_TEMPERATURE_TIMER_DELTA;
+    ESP_ERROR_CHECK(h2pca_task_pool_add_task(&(app_cfg.tasks), tsk));
+
+    tsk = h2pca_new_task("Broadcast", 2, NULL, &err);
+    ESP_ERROR_CHECK(err);
+    tsk->on_time = &broadcast_cb;
+    tsk->on_sync = &sync_broadcast_task_cb;
+    tsk->apply_bitmask = MODE_SEND_BROAD;
+    tsk->req_bitmask = HOST_CONNECTED_BIT|WIFI_CONNECTED_BIT;
+    tsk->period = BROADCAST_TIMER_DELTA;
+    ESP_ERROR_CHECK(h2pca_task_pool_add_task(&(app_cfg.tasks), tsk));
+
+    h2pca_app = h2pca_init(&app_cfg, &err);
+
+    if (h2pca_app == NULL) {
+        ESP_LOGE(WC_TAG, "Application not initialized, error code %d", err);
+        ESP_ERROR_CHECK(err);
+    }
+
     vars_mux = xSemaphoreCreateRecursiveMutex();
-
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK( err );
-
-    /* generate mac address and device metadata */
-    uint8_t sta_mac[6];
-    ESP_ERROR_CHECK( esp_efuse_mac_get_default(sta_mac) );
-    for (int i = 0; i < 6; i++) {
-        mac_str[i<<1] = UPPER_XDIGITS[(sta_mac[i] >> 4) & 0x0f];
-        mac_str[(i<<1) + 1] = UPPER_XDIGITS[(sta_mac[i] & 0x0f)];
-    }
-
-    mac_str[12] = 0;
-
-    DEVICE_CHAR[4] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 12) & 0x000f)];
-    DEVICE_CHAR[5] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 8) & 0x000f)];
-    DEVICE_CHAR[6] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID >> 4) & 0x000f)];
-    DEVICE_CHAR[7] = UPPER_XDIGITS[(uint8_t)((CONFIG_WC_DEVICE_CHAR1_UUID) & 0x000f)];
-    device_meta_data = cJSON_CreateObject();
-    cJSON_AddItemToObject(device_meta_data, JSON_BLE_CHAR, cJSON_CreateStringReference(DEVICE_CHAR));
 
     init_board_gpio();
 
@@ -1334,5 +893,5 @@ void app_main()
     esp_timer_start_periodic(blink_led, LED_BLINK_TIMER_DELTA);
 
     /* start main task */
-    xTaskCreate(&main_task, "main_task", (1024 * 48), NULL, 5, NULL);
+    h2pca_start(0);
 }

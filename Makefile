@@ -5,4 +5,4 @@
 
 PROJECT_NAME := radiodevice
 
-include /home/ilya/media/projects/esp32/esp-adf/esp-idf/make/project.mk
+include $(IDF_PATH)/make/project.mk
