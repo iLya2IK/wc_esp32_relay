@@ -1,0 +1,12 @@
+{
+    "debug":true,
+    "device_name":"tre_001",
+    "account_login":"thermo",
+    "account_pwd":"111",
+    "wcserver": {
+        "host":"https://127.0.0.1",
+        "port":8080,
+        "verifyTLS":false,
+        "proxy":""
+    }
+}
